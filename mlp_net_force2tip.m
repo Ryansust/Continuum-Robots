@@ -1,5 +1,5 @@
 % Add this as the first or second line of your entire script
-rng('default'); % Resets the random number generator to a predictable state
+%rng('default'); % Resets the random number generator to a predictable state
 clc;
 clear;
 close all;
@@ -47,7 +47,7 @@ disp('Step 2: Defining the Network Architecture...');
 % A simple feed-forward network is perfect for this.
 % We will create a network with one hidden layer of 15 neurons.
 % 'feedforwardnet' is great for regression problems (predicting continuous values).
-hiddenLayerSize = 9;
+hiddenLayerSize = 30;%9;
 net = feedforwardnet(hiddenLayerSize);
 %net.trainFcn = 'trainbr';
 
