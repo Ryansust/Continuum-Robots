@@ -1,0 +1,141 @@
+%% ========================================================================
+%  【防卡死极速版】全局随机抽 100 组算尖端误差，画最差的前 5 组
+% =========================================================================
+clc; clear; close all;
+
+%% 1. 读取并解析 Excel 数据
+disp('1. 正在读取并解析 Excel 数据...');
+FileName = '/Users/ryan/Desktop/continuum robot/force_data/after_processing_data_0816.xlsx';
+dataTable = readtable(FileName);
+
+force_array = double(table2array(dataTable(3:end, 11:16)));
+outer_force_array = double(table2array(dataTable(3:end, 2))); 
+direction_array = double(table2array(dataTable(3:end, 3)));
+height_array = double(table2array(dataTable(3:end, 4)));
+position_text_array = dataTable{3:end, 38};
+
+%% 2. 随机抽样 (核心防卡死保护！)
+disp('2. 正在随机抽取 100 组数据...');
+total_rows = size(force_array, 1);
+num_fast_test = 100; % <--- 绝不卡死，只测 100 组！(几秒钟就能跑完)
+
+% 随机打乱并抽取 100 个行号
+selected_indices = randperm(total_rows, num_fast_test);
+
+%% 3. 机器人基础参数设置
+tendon = 3;         
+section = 2;        
+D = 0.0006;         
+%E = 1.016e+12;      % <--- 在这里调整弹性模量
+E = 0.516e+12;%final result
+L_a = 0.0665;         
+L_b = 0.00;         
+N_d = 7;            
+H_list = linspace(0.0025, 0.0025, section*N_d+1); 
+mu = 0.25;          
+delta_alpha = 0; 
+G_load = 4.000 * 0.00981; 
+
+%% 4. 仅计算这 100 组的尖端误差 (Tip Error)
+fprintf('3. 开始极速计算 %d 组数据的尖端误差...\n', num_fast_test);
+tip_errors = zeros(1, num_fast_test);
+
+for k = 1:num_fast_test
+    exp_id = selected_indices(k);
+    
+    % --- 提取参数 ---
+    F_tendon = force_array(exp_id, :) * 0.00981; 
+    F_tendon2 = F_tendon([5, 6, 1, 2, 3, 4]); % 拉力重排
+    
+    dir_code = direction_array(exp_id);
+    u_vec = [0;0;0];
+    switch dir_code
+        case 2, u_vec = [-1; 0; 0];
+        case 3, u_vec = [-sind(45); cosd(45); 0];
+        case 4, u_vec = [0; 1; 0];
+    end
+    F_ex = 0 * u_vec; % 外力归零
+    
+    touch_id = height_array(exp_id); 
+    if touch_id == 0, touch_id = section * N_d; end 
+    
+    % --- 真实轨迹尖端 ---
+    P_Real_Raw = get_RealOffset_1S3CT(position_text_array{exp_id});
+    Tip_Real = P_Real_Raw(:, end); 
+    
+    % --- 求解物理模型尖端 ---
+    [P_Theo, ~, ~, ~, ~, ~] = solve_continuum_shape_nofig(tendon, section, D, E, L_a, L_b, N_d, H_list, mu, delta_alpha, G_load, F_ex, F_tendon2, touch_id);
+    Tip_Theo = P_Theo(:, end);     
+    
+    % --- 计算距离误差 ---
+    tip_errors(k) = norm(Tip_Theo - Tip_Real) * 1000;
+end
+
+% 统计结果
+avg_tip_error = mean(tip_errors);
+fprintf('\n======================================================\n');
+fprintf('🎯 测试完成！抽样的 %d 组平均尖端误差为: %.2f mm\n', num_fast_test, avg_tip_error);
+fprintf('======================================================\n');
+
+%% 5. 找出误差最大的 5 组并画图
+num_plots = 5; 
+[sorted_errors, sort_idx] = sort(tip_errors, 'descend'); % 找出最差的
+worst_indices = sort_idx(1:num_plots);
+
+disp('4. 正在为误差最大的 5 组数据生成 3D 骨架对比图...');
+
+for i = 1:num_plots
+    k = worst_indices(i);
+    exp_id = selected_indices(k);
+    err_val = sorted_errors(i);
+    
+    % 重新简单提取
+    F_tendon = force_array(exp_id, :) * 0.00981; 
+    F_tendon2 = F_tendon([5, 6, 1, 2, 3, 4]);
+    dir_code = direction_array(exp_id);
+    touch_id = height_array(exp_id); 
+    if touch_id == 0, touch_id = section * N_d; end 
+    
+    % 真值 (严格剔除基座点，只留 7 个主干)
+    P_Real_Raw = get_RealOffset_1S3CT(position_text_array{exp_id});
+    P_Real = P_Real_Raw(:, end-6:end); 
+    Tip_Real = P_Real(:, end);
+    
+    % 理论值
+    [P_Theo, ~, ~, ~, ~, ~] = solve_continuum_shape(tendon, section, D, E, L_a, L_b, N_d, H_list, mu, delta_alpha, G_load,[0;0;0], F_tendon2, touch_id);
+    Tip_Theo = P_Theo(:, end);
+    
+    % --- 开始画图 ---
+    figure('Name', sprintf('Worst Case #%d (Index: %d)', i, exp_id), 'Color', 'w', 'Position',[100 + i*40, 100 + i*40, 800, 600]);
+    hold on; grid on; axis equal;
+    
+    % 画真实主干和理论模型
+    h_real = plot3(P_Real(1,:), P_Real(2,:), P_Real(3,:), '--bs', 'LineWidth', 1.5, 'MarkerFaceColor', 'b');
+    h_theo = plot3(P_Theo(1,:), P_Theo(2,:), P_Theo(3,:), '-ro', 'LineWidth', 1.5, 'MarkerSize', 3, 'MarkerFaceColor', 'r');
+    
+    % 高亮尖端 (五角星 + 黑色偏差连线)
+    plot3(Tip_Real(1), Tip_Real(2), Tip_Real(3), 'bp', 'MarkerSize', 12, 'MarkerFaceColor', 'b');
+    plot3(Tip_Theo(1), Tip_Theo(2), Tip_Theo(3), 'rp', 'MarkerSize', 12, 'MarkerFaceColor', 'r');
+    plot3([Tip_Real(1), Tip_Theo(1)],[Tip_Real(2), Tip_Theo(2)],[Tip_Real(3), Tip_Theo(3)], 'k-', 'LineWidth', 2);
+    
+    % 坐标系
+    quiver3(0,0,0, 0.05,0,0, 'r', 'LineWidth', 3, 'MaxHeadSize', 0.5); 
+    quiver3(0,0,0, 0,0.05,0, 'g', 'LineWidth', 3, 'MaxHeadSize', 0.5); 
+    quiver3(0,0,0, 0,0,0.05, 'b', 'LineWidth', 3, 'MaxHeadSize', 0.5); 
+    
+    force_text = sprintf('【Worst Case #%d】\nIndex: %d | Dir: %d\nT_1: %.3f N  T_2: %.3f N  T_3: %.3f N\nT_4: %.3f N  T_5: %.3f N  T_6: %.3f N\n-----------------------\nTip Error: %.2f mm', ...
+                         i, exp_id, dir_code, ...
+                         F_tendon(1), F_tendon(2), F_tendon(3), ...
+                         F_tendon(4), F_tendon(5), F_tendon(6), err_val);
+                     
+    text(0.05, 0.95, force_text, 'Units', 'normalized', ...
+        'FontSize', 10, 'FontName', 'Courier New', 'FontWeight', 'bold', ...
+        'BackgroundColor',[1 1 1 0.8], 'EdgeColor', 'k', 'Margin', 5, 'VerticalAlignment', 'top');
+
+    xlabel('X'); ylabel('Y'); zlabel('Z');
+    title(sprintf('Top %d Worst Tip Error: %.2f mm', i, err_val));
+    view(30, 20);
+    legend([h_real, h_theo], {'Ground Truth (Pure)', 'Theoretical'}, 'Location', 'southoutside', 'Orientation', 'horizontal');
+end
+
+disp('✅ 全部执行完毕！请查看排名前 5 的 3D 误差图。');

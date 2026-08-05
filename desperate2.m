@@ -1,0 +1,365 @@
+%% ========================================================================
+%  Project: Pure Neural Network Baseline (Sensor-Only Proprioception)
+%  Goal:    对比实验 - 使用【传感器实测 P_before】作为输入特征
+%  Author:  Lin Yongxi (Logic Corrected)
+% =========================================================================
+clc; clear; close all;
+rng('default'); 
+
+%% ========================================================================
+%  Step 1: 数据读取、ROI 筛选与位姿解析
+% =========================================================================
+disp('--------------------------------------------------');
+disp('1. 正在读取原始数据 (纯神经网络对比组)...');
+
+% 1.1 读取 Excel
+FileName = '/Users/ryan/Desktop/continuum robot/force_data/after_processing_data_0816.xlsx';
+if ~isfile(FileName), error('未找到文件！'); end
+dataTable = readtable(FileName);
+
+% 1.2 提取原始信号
+F_after_raw  = double(table2array(dataTable(3:end, 23:28)))';  
+F_before_raw = double(table2array(dataTable(3:end, 11:16)))';  
+raw_mag_raw  = double(abs(table2array(dataTable(3:end, 2))))'; 
+raw_dir_raw  = double(table2array(dataTable(3:end, 3)))';      
+raw_hgt_raw  = double(table2array(dataTable(3:end, 4)))'; 
+
+% 🌟 分别提取受力前和受力后的位姿文本 (假设 29 为受力前，38 为受力后)
+pos_text_before_raw = dataTable{3:end, 29}; 
+pos_text_after_raw  = dataTable{3:end, 38}; 
+
+% 1.3 ROI 筛选
+disp('   > 执行 ROI 筛选 (Nodes 3, 4, 5)...');
+roi_mask = ismember(raw_hgt_raw, [3, 4, 5]);
+
+F_after_sub  = F_after_raw(:, roi_mask);
+F_before_sub = F_before_raw(:, roi_mask);
+raw_mag_sub  = raw_mag_raw(roi_mask);
+raw_dir_sub  = raw_dir_raw(roi_mask);
+raw_hgt_sub  = raw_hgt_raw(roi_mask);
+pos_text_before_sub = pos_text_before_raw(roi_mask);
+pos_text_after_sub  = pos_text_after_raw(roi_mask);
+if length(raw_mag_sub) < 50, error('Insufficient data after ROI filtering.'); end
+
+% 1.4 数据清洗
+disp('   > 正在剔除无效样本...');
+bad_idx = any(isnan(F_after_sub), 1) | any(isnan(F_before_sub), 1) | ...
+          isnan(raw_mag_sub) | isnan(raw_dir_sub) | isnan(raw_hgt_sub);
+known_outliers = [686];
+if ~isempty(known_outliers)
+    fprintf('   ⚠手动剔除已知异常样本 ID: %s\n', num2str(known_outliers));
+    bad_idx(known_outliers) = true; % 强制标记为坏样本
+end
+
+F_after  = F_after_sub(:, ~bad_idx);
+F_before = F_before_sub(:, ~bad_idx);
+raw_mag  = raw_mag_sub(~bad_idx);
+raw_dir  = raw_dir_sub(~bad_idx);
+raw_hgt  = raw_hgt_sub(~bad_idx);
+pos_b_eval = pos_text_before_sub(~bad_idx);
+pos_a_eval = pos_text_after_sub(~bad_idx);
+
+F_diff = F_after - F_before;
+N = length(raw_mag);
+fprintf('   > Final effective samples: %d\n', N);
+
+% 1.5 位姿解析 (输入特征和目标真值全部来自传感器)
+disp('   > 正在解析传感器位姿 (Before 作为输入, After 作为目标)...');
+P_before_sensor = zeros(21, N); 
+P_after_sensor  = zeros(21, N); 
+gt_F_vec = zeros(3, N);
+
+for i = 1:N
+    % A. 解析受力前传感器位姿 (作为 Input Feature)
+    r_off_b = get_RealOffset_1S3CT(pos_b_eval{i});
+    P_before_sensor(:, i) = reshape(r_off_b(:, 3:end), 21, 1); 
+    
+    % B. 解析受力后传感器位姿 (作为 Target)
+    r_off_a = get_RealOffset_1S3CT(pos_a_eval{i});
+    P_after_sensor(:, i) = reshape(r_off_a(:, 3:end), 21, 1); 
+    
+    % C. 外力矢量
+    u_vec = [0;0;0];
+    switch raw_dir(i)
+        case 2, u_vec = [-1; 0; 0];
+        case 3, u_vec = [-sind(45); cosd(45); 0];
+        case 4, u_vec = [0; 1; 0];
+    end
+    gt_F_vec(:, i) = raw_mag(i) * u_vec;
+end
+
+%% ========================================================================
+%  Step 2: 数据增强 (同步旋转)
+% =========================================================================
+disp('--------------------------------------------------');
+disp('2. 正在执行同步旋转增强 (Sensor Feature & Sensor Target)...');
+[aug_F_diff, aug_F_after, aug_F_before, aug_Pb_sensor, aug_Pa_sensor, aug_gt_F, aug_hgt] = ...
+    augment_data_consistent(F_diff, F_after, F_before, P_before_sensor, P_after_sensor, gt_F_vec, raw_hgt);
+
+%% ========================================================================
+%  Step 3: 训练集构建与安全检查
+% =========================================================================
+disp('--------------------------------------------------');
+disp('3. 正在构建训练集...');
+
+% 3.1 Net B 数据集
+inputs_f_final   = [aug_F_after; aug_F_diff; aug_F_before]; 
+targets_f_final  = aug_gt_F;
+
+% 3.2 Net C 数据集 (输入含传感器实测的 Pb_sensor)
+inputs_loc_final = [aug_F_diff; aug_F_after; aug_Pb_sensor]; 
+targets_loc_final = double(aug_hgt) / 9.0; 
+targets_shape_final = aug_Pa_sensor; % 碰撞后实测位姿
+
+% 3.3 安全检查
+bad_total = any(isnan(inputs_f_final), 1) | any(isinf(inputs_f_final), 1) | ...
+            any(isnan(inputs_loc_final), 1) | any(isinf(inputs_loc_final), 1) | ...
+            any(isnan(targets_shape_final), 1);
+if sum(bad_total) > 0
+    fprintf('   [Warning] Removing %d bad augmented samples.\n', sum(bad_total));
+    inputs_f_final(:, bad_total) = []; targets_f_final(:, bad_total) = [];
+    inputs_loc_final(:, bad_total) = []; targets_loc_final(:, bad_total) = [];
+    aug_gt_F(:, bad_total) = []; targets_shape_final(:, bad_total) = [];
+end
+% 3.4 注入噪声
+epsilon = 1e-7;
+inputs_f_final = inputs_f_final + epsilon * randn(size(inputs_f_final));
+targets_f_final = targets_f_final + epsilon * randn(size(targets_f_final));
+inputs_loc_final = inputs_loc_final + epsilon * randn(size(inputs_loc_final));
+
+fprintf('   > 入网样本数: %d\n', size(inputs_f_final, 2));
+
+%% ========================================================================
+%  Step 4: Net B - Force Estimation
+% =========================================================================
+disp('--------------------------------------------------');
+disp('4. Training Net B Force...');
+
+net_force = feedforwardnet([40, 20]);
+net_force.trainFcn = 'trainlm';
+net_force.trainParam.showWindow = false;
+
+[net_force, tr_f] = train(net_force, inputs_f_final, targets_f_final);
+
+% Evaluate
+pred_f = net_force(inputs_f_final(:, tr_f.testInd));
+targ_f = targets_f_final(:, tr_f.testInd);
+
+if any(isnan(pred_f(:))), error('Net B Force produced NaN!'); end
+mae_f = mean(abs(sqrt(sum(pred_f.^2)) - sqrt(sum(targ_f.^2))));
+fprintf('   > Force MAE: %.4f N\n', mae_f);
+
+%% ========================================================================
+%  Step 5: Net B - Location Sensing (Weighted Loss)
+% =========================================================================
+disp('--------------------------------------------------');
+disp('5. Training Net B Location (Weighted Loss)...');
+
+% 5.1 Filter High-Force Samples
+v_mask = sqrt(sum(aug_gt_F.^2)) > 0.08;
+raw_in = inputs_loc_final(:, v_mask);
+raw_tg = targets_loc_final(:, v_mask);
+node_labels = round(raw_tg * 9.0);
+
+% 5.2 Calculate Weights (Inverse Frequency)
+nodes_interest = [3, 4, 5];
+weights_vec = ones(1, length(node_labels));
+fprintf('   > Sample Distribution:\n');
+for k = nodes_interest
+    idx_k = (node_labels == k);
+    count_k = sum(idx_k);
+    if count_k > 0
+        w_k = length(node_labels) / (length(nodes_interest) * count_k);
+        weights_vec(idx_k) = w_k;
+        fprintf('     - Node %d: %d samples, Weight: %.2f\n', k, count_k, w_k);
+    end
+end
+
+% 5.3 Train
+[in_norm, ps_in] = mapstd(raw_in); 
+[tg_norm, ps_out] = mapstd(raw_tg);
+
+net_loc = fitnet([60, 40, 20]);
+net_loc.trainFcn = 'trainlm'; 
+net_loc.trainParam.showWindow = true; 
+net_loc.trainParam.epochs = 1500;
+net_loc.trainParam.max_fail = 20; 
+net_loc.trainParam.goal = 1e-6;
+
+
+net_loc.divideParam.trainRatio = 0.80;
+net_loc.divideParam.valRatio   = 0.20;
+net_loc.divideParam.testRatio  = 0.0;  % Manual eval later
+
+[net_loc, tr_l] = train(net_loc, in_norm, tg_norm, [], [], weights_vec);
+
+%% ========================================================================
+%  Step 6: Evaluation & Visualization (Net B)
+% =========================================================================
+disp('--------------------------------------------------');
+disp('6. Evaluating Net B performance...');
+
+% Predict
+pred_val = mapstd('reverse', net_loc(mapstd('apply', raw_in, ps_in)), ps_out);
+pred_node = pred_val * 9.0;
+real_node = raw_tg * 9.0;
+
+% Clamp & Metrics
+pred_node(pred_node < 3) = 3; pred_node(pred_node > 5) = 5;
+rmse_node = sqrt(mean((pred_node - real_node).^2));
+acc_strict = sum(round(pred_node) == round(real_node)) / length(real_node);
+
+fprintf('   > [Final] RMSE: %.2f Segment\n', rmse_node);
+fprintf('   > [Final] Strict Accuracy: %.2f%%\n', acc_strict * 100);
+
+% Plotting
+figure('Name', 'Net B: Location Results', 'Color', 'w', 'Position', [100, 100, 1000, 400]);
+subplot(1, 2, 1);
+jitter = (rand(size(pred_node))-0.5)*0.15;
+scatter(real_node, pred_node+jitter, 30, abs(real_node-pred_node), 'filled', 'MarkerFaceAlpha', 0.7);
+colormap(jet); caxis([0 1]); colorbar; hold on; plot([2, 6], [2, 6], 'k--');
+title(['Regression (RMSE: ', num2str(rmse_node, '%.2f'), ')']);
+xlabel('Truth'); ylabel('Pred');
+
+subplot(1, 2, 2);
+cm = confusionchart(round(real_node), round(pred_node));
+cm.Title = 'Confusion Matrix (Weighted)';
+cm.RowSummary = 'row-normalized'; 
+sortClasses(cm, 'ascending');
+
+%% ========================================================================
+%  Step 7: 训练纯神经网络 Net C (传感器输入 -> 传感器目标)
+% =========================================================================
+disp('--------------------------------------------------');
+disp('7. 正在训练 Net C (纯神经网络 - 无物理增强特征)...');
+
+% 构建级联输入
+feat_internal = raw_in_l(7:12, :);      % F_after
+feat_external = targets_f_final(:, v_mask); % F_ext (GT)
+feat_location = raw_tg_l;               % Location (GT)
+
+inputs_net_c = [feat_internal; feat_external; feat_location];
+targets_net_c = raw_tg_s; % 碰撞后实测位姿
+
+% 训练
+[in_c_norm, ps_in_c] = mapstd(inputs_net_c);
+[tg_c_norm, ps_out_c] = mapstd(targets_net_c);
+
+net_shape = fitnet([80, 60, 40]); 
+net_shape.trainFcn = 'trainscg';
+net_shape.trainParam.epochs = 2000;
+net_shape.trainParam.goal = 1e-7;
+net_shape.trainParam.max_fail = 50;
+
+% Split 80/10/10
+net_shape.divideParam.trainRatio = 0.8;
+net_shape.divideParam.valRatio   = 0.1;
+net_shape.divideParam.testRatio  = 0.1;
+
+[net_shape, tr_c] = train(net_shape, in_c_norm, tg_c_norm);
+
+%% ========================================================================
+%  Step 8 & 9: 评估可视化
+% =========================================================================
+disp('--------------------------------------------------');
+disp('8. 正在评估纯神经网络性能...');
+
+test_idx = tr_c.testInd;
+if isempty(test_idx), test_idx = randperm(size(inputs_net_c,2), 50); end
+
+in_test = inputs_net_c(:, test_idx);
+target_test = targets_net_c(:, test_idx);
+
+pred_test = mapstd('reverse', net_shape(mapstd('apply', in_test, ps_in_c)), ps_out_c);
+
+% 形态误差 MAE
+dist_errs = zeros(1, length(test_idx));
+for i = 1:length(test_idx)
+    p_p = reshape(pred_test(:, i), 3, 7);
+    p_r = reshape(target_test(:, i), 3, 7);
+    dist_errs(i) = mean(sqrt(sum((p_p - p_r).^2, 1)));
+end
+mean_dist = mean(dist_errs);
+fprintf('   > [Pure NN] Mean Shape Error: %.2f mm\n', mean(dist_errs)*1000);
+% 3D Visualization
+figure('Name', '3D Shape Reconstruction', 'Color', 'w', 'Position', [100, 100, 1200, 500]);
+num_plot = 4;
+plot_ids = test_idx(randperm(length(test_idx), num_plot));
+
+for k = 1:num_plot
+    idx = plot_ids(k);
+    P_p = [[0;0;0], reshape(pred_test(:, find(test_idx==idx,1)), 3, [])];
+    P_r = [[0;0;0], reshape(target_test(:, find(test_idx==idx,1)), 3, [])];
+    
+    subplot(1, num_plot, k);
+    plot3(P_r(1,:), P_r(2,:), P_r(3,:), 'k-o', 'LineWidth', 2); hold on;
+    plot3(P_p(1,:), P_p(2,:), P_p(3,:), 'r--.', 'LineWidth', 1.5);
+    grid on; axis equal; xlabel('X'); zlabel('Z'); 
+    title(['Sample ', num2str(k)]);
+    if k==1, legend('Truth', 'Pred'); end
+    view(30, 20);
+end
+%% ========================================================================
+%  Step 9: Tip Error Analysis (Corrected Variable Names)
+% =========================================================================
+disp('--------------------------------------------------');
+disp('9. Analyzing Tip-Specific Error...');
+
+tip_idx = [19, 20, 21];
+tip_pred = pred_test(tip_idx, :);
+tip_real = target_test(tip_idx, :);
+
+tip_vec = tip_pred - tip_real;
+tip_dist = sqrt(sum(tip_vec.^2, 1)); 
+
+tip_mae = mean(tip_dist);
+tip_rmse = sqrt(mean(tip_dist.^2));
+tip_max = max(tip_dist);
+
+fprintf('   > [Tip] MAE:  %.4f m (%.2f mm)\n', tip_mae, tip_mae*1000);
+fprintf('   > [Tip] RMSE: %.4f m (%.2f mm)\n', tip_rmse, tip_rmse*1000);
+fprintf('   > [Tip] Max:  %.4f m (%.2f mm)\n', tip_max, tip_max*1000);
+% 可视化图 1: 3D 重构随机抽样
+% Visualization
+figure('Name', 'Tip Error Analysis', 'Color', 'w', 'Position', [100, 200, 1000, 400]);
+
+subplot(1, 2, 1);
+num_show = min(50, length(tip_dist));
+idx_show = randperm(length(tip_dist), num_show);
+hold on; grid on; axis equal;
+h1 = plot3(NaN,NaN,NaN, 'bo'); h2 = plot3(NaN,NaN,NaN, 'r.');
+
+for k = idx_show
+    p_r = tip_real(:, k); p_p = tip_pred(:, k);
+    plot3([p_r(1), p_p(1)], [p_r(2), p_p(2)], [p_r(3), p_p(3)], 'Color', [0.7 0.7 0.7]);
+    plot3(p_r(1), p_r(2), p_r(3), 'bo', 'MarkerSize', 5, 'MarkerFaceColor', 'b');
+    plot3(p_p(1), p_p(2), p_p(3), 'r.', 'MarkerSize', 10);
+end
+xlabel('X'); ylabel('Y'); zlabel('Z'); title('Tip Tracking'); legend([h1, h2], {'GT', 'Pred'}); view(45, 30);
+
+subplot(1, 2, 2);
+histogram(tip_dist * 1000, 30, 'FaceColor', [0.2 0.6 0.3]);
+xline(tip_mae * 1000, 'r--', 'LineWidth', 2);
+xlabel('Error (mm)'); ylabel('Count'); title('Tip Error Dist.'); grid on;
+
+disp('>>> All done.');
+
+%% ========================================================================
+%  Helper Functions
+% =========================================================================
+function [aug_Fd, aug_Fa, aug_Fb, aug_Pb, aug_Pa, aug_gF, aug_h] = ...
+    augment_data_consistent(F_diff, F_after, F_before, P_b, P_a, gt_F, hgt)
+    N = size(F_diff, 2);
+    R120 = [cosd(120), -sind(120), 0; sind(120), cosd(120), 0; 0, 0, 1];
+    R240 = [cosd(240), -sind(240), 0; sind(240), cosd(240), 0; 0, 0, 1];
+    idx120 = [5, 6, 1, 2, 3, 4]; idx240 = [3, 4, 5, 6, 1, 2];
+    rotP = @(P, R) reshape(R * reshape(P, 3, []), 21, N);
+    
+    aug_Fd = [F_diff, F_diff(idx120,:), F_diff(idx240,:)];
+    aug_Fa = [F_after, F_after(idx120,:), F_after(idx240,:)];
+    aug_Fb = [F_before, F_before(idx120,:), F_before(idx240,:)];
+    aug_Pb = [P_b, rotP(P_b, R120), rotP(P_b, R240)];
+    aug_Pa = [P_a, rotP(P_a, R120), rotP(P_a, R240)];
+    aug_gF = [gt_F, R120*gt_F, R240*gt_F];
+    aug_h  = [hgt, hgt, hgt];
+end
